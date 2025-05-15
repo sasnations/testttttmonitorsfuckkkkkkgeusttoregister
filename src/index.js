@@ -17,6 +17,7 @@ import monitorRoutes from './routes/monitor.js';
 import gmailRoutes from './routes/gmailRoutes.js'; // Added Gmail routes
 import debugRoutes from './routes/debug.js'; // Added Debug routes
 import guestRoutes from './routes/guest.js'; // Added Guest routes
+import guestPostRoutes from './routes/guestPost.js'; // Added Guest Post routes
 import nodemailer from 'nodemailer';
 import http from 'http'; // Added for WebSocket support
 import { setupWebSocketServer } from './services/gmailImapService.js'; // Added for WebSocket
@@ -152,6 +153,7 @@ app.use('/monitor', monitorRoutes);
 app.use('/gmail', gmailRoutes); // Add Gmail routes
 app.use('/debug', debugRoutes); // Add Debug routes
 app.use('/guest', guestRoutes); // Add Guest routes
+app.use('/guest-post', guestPostRoutes); // Add Guest Post routes
 
 // Handle preflight requests for /admin/all
 app.options('/emails/admin/all', cors());
