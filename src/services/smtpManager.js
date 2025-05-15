@@ -291,7 +291,7 @@ class SMTPManager {
     }
   }
 
-  async sendEmail(to, subject, html) {
+  async sendEmail(to, subject, html, retryCount = 0) {
     try {
       if (!this.transporter || !this.currentSMTP) {
         await this.initialize();
@@ -345,7 +345,7 @@ class SMTPManager {
           return this.sendEmailWithBasicConfig(to, subject, html);
         }
 
-        // Update error stats
+        // Update error stats for current SMTP
         try {
           await connection.query(`
             UPDATE smtp_servers 
@@ -359,15 +359,44 @@ class SMTPManager {
           console.error('Failed to update SMTP error stats:', statsError);
         }
         
-        throw error;
+        // Check if we've exceeded max retry attempts to prevent infinite loops
+        const MAX_RETRY_ATTEMPTS = 5;
+        if (retryCount >= MAX_RETRY_ATTEMPTS) {
+          console.error(`Reached maximum retry attempts (${MAX_RETRY_ATTEMPTS}). Falling back to basic SMTP.`);
+          return this.sendEmailWithBasicConfig(to, subject, html);
+        }
+        
+        // Try rotating to next SMTP and retry
+        console.log(`SMTP error encountered. Rotating to next SMTP and retrying. Attempt ${retryCount + 1} of ${MAX_RETRY_ATTEMPTS}.`);
+        try {
+          await this.rotateToNextSMTP();
+          
+          // Recursively retry with the new SMTP server
+          return this.sendEmail(to, subject, html, retryCount + 1);
+        } catch (rotationError) {
+          console.error('Failed to rotate SMTP server:', rotationError);
+          // If rotation also failed, fall back to basic SMTP
+          return this.sendEmailWithBasicConfig(to, subject, html);
+        }
       } finally {
         connection.release();
       }
     } catch (error) {
       console.error('Error sending email:', error);
       
-      // As a last resort, try using basic SMTP config
-      return this.sendEmailWithBasicConfig(to, subject, html);
+      // Only fall back to basic SMTP if we've exhausted retries
+      if (retryCount >= 4) {
+        console.log('Exhausted all retry attempts. Using basic SMTP as last resort.');
+        return this.sendEmailWithBasicConfig(to, subject, html);
+      } else {
+        // Try rotation one more time in case of unexpected errors
+        try {
+          await this.rotateToNextSMTP();
+          return this.sendEmail(to, subject, html, retryCount + 1);
+        } catch (finalError) {
+          return this.sendEmailWithBasicConfig(to, subject, html);
+        }
+      }
     }
   }
 
