@@ -27,6 +27,9 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Trust proxy - Add this line to fix the X-Forwarded-For validation error
+app.set('trust proxy', 1); // Trust first proxy
+
 // Create HTTP server (instead of using app.listen)
 const server = http.createServer(app);
 
