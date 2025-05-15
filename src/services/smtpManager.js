@@ -14,11 +14,11 @@ class SMTPManager {
     for (let i = 1; i <= 20; i++) {
       const username = process.env[`SMTP_USER_${i}`];
       const password = process.env[`SMTP_PASS_${i}`];
-      const fromEmail = process.env[`SMTP_FROM_${i}`];
+      const fromEmail = process.env[`SMTP_FROM_${i}`] || username;
       const fromName = process.env[`SMTP_NAME_${i}`];
 
       // Skip if required credentials are missing
-      if (!username || !password || !fromEmail) continue;
+      if (!username || !password) continue;
 
       this.smtpConfigs.push({
         id: `smtp-${i}`,
