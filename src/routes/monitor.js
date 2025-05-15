@@ -535,6 +535,54 @@ router.get('/ip-behaviors', async (req, res) => {
   }
 });
 
+// Get password reset statistics
+router.get('/password-reset-stats', (req, res) => {
+  if (!checkAdminPassphrase(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    // Initialize stats if not present
+    if (!global.passwordResetStats) {
+      global.passwordResetStats = {
+        date: new Date().toISOString().split('T')[0],
+        attempts: 0,
+        success: 0,
+        failure: 0
+      };
+    }
+    
+    // Reset stats if it's a new day
+    if (global.passwordResetStats.date !== new Date().toISOString().split('T')[0]) {
+      global.passwordResetStats = {
+        date: new Date().toISOString().split('T')[0],
+        attempts: 0,
+        success: 0,
+        failure: 0
+      };
+    }
+    
+    // Calculate success ratio
+    const successRatio = global.passwordResetStats.attempts > 0 
+      ? (global.passwordResetStats.success / global.passwordResetStats.attempts * 100).toFixed(2) 
+      : 0;
+    
+    // Calculate failure ratio
+    const failureRatio = global.passwordResetStats.attempts > 0 
+      ? (global.passwordResetStats.failure / global.passwordResetStats.attempts * 100).toFixed(2) 
+      : 0;
+    
+    res.json({
+      ...global.passwordResetStats,
+      successRatio: `${successRatio}%`,
+      failureRatio: `${failureRatio}%`
+    });
+  } catch (error) {
+    console.error('Failed to fetch password reset stats:', error);
+    res.status(500).json({ error: 'Failed to fetch password reset statistics' });
+  }
+});
+
 // Get blocked IPs
 router.get('/blocked-ips', async (req, res) => {
   if (!checkAdminPassphrase(req)) {

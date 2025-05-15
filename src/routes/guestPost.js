@@ -119,16 +119,26 @@ router.post('/submit', validateGuestPostSubmission, async (req, res) => {
       );
       
       // Log the submission
-      await connection.query(`
-        INSERT INTO activity_log (
-          activity_type, user_id, details, ip_address, created_at
-        ) VALUES (?, ?, ?, ?, NOW())
-      `, [
-        'guest_post_submission',
-        null, // No user ID for guest submissions
-        JSON.stringify({ submissionId, name: fullName, email, website: websiteUrl }),
-        req.ip
-      ]);
+      try {
+        await connection.query(`
+          INSERT INTO activity_log (
+            activity_type, user_id, details, ip_address, created_at
+          ) VALUES (?, ?, ?, ?, NOW())
+        `, [
+          'guest_post_submission',
+          null, // No user ID for guest submissions
+          JSON.stringify({ submissionId, name: fullName, email, website: websiteUrl }),
+          req.ip
+        ]);
+      } catch (logError) {
+        // If activity_log table doesn't exist, just log a warning and continue
+        if (logError.code === 'ER_NO_SUCH_TABLE') {
+          console.warn('Activity log table does not exist. Skipping activity logging.');
+        } else {
+          console.error('Error logging activity:', logError);
+        }
+        // Don't throw error as this shouldn't stop the main process
+      }
       
       await connection.commit();
       

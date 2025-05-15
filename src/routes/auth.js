@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { pool } from '../db/init.js';
 import { authenticateToken, authenticateMasterPassword } from '../middleware/auth.js';
 import { mailTransporter } from '../index.js';
+import smtpManager from '../services/smtpManager.js';
 import { getPasswordResetEmailTemplate } from '../templates/passwordReset.js';
 
 const router = express.Router();
@@ -118,6 +119,26 @@ router.post('/forgot-password', async (req, res) => {
     // Check if user exists
     const [users] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
     if (users.length === 0) {
+      // Track failed attempt
+      global.passwordResetStats = global.passwordResetStats || {
+        date: new Date().toISOString().split('T')[0],
+        attempts: 0,
+        success: 0,
+        failure: 0
+      };
+      
+      if (global.passwordResetStats.date !== new Date().toISOString().split('T')[0]) {
+        global.passwordResetStats = {
+          date: new Date().toISOString().split('T')[0],
+          attempts: 1,
+          success: 0,
+          failure: 1
+        };
+      } else {
+        global.passwordResetStats.attempts++;
+        global.passwordResetStats.failure++;
+      }
+      
       return res.status(404).json({ error: 'User not found' });
     }
 
@@ -134,18 +155,58 @@ router.post('/forgot-password', async (req, res) => {
     // Generate reset link
     const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
 
-    // Send email
+    // Send email using SMTP rotation instead of mailTransporter
     const emailTemplate = getPasswordResetEmailTemplate(resetLink);
-    await mailTransporter.sendMail({
-      from: `"Boomlify Support" <${process.env.SMTP_USER}>`,
-      to: email,
-      subject: emailTemplate.subject,
-      html: emailTemplate.html
-    });
+    await smtpManager.sendEmail(
+      email,
+      emailTemplate.subject,
+      emailTemplate.html
+    );
+
+    // Track successful attempt
+    global.passwordResetStats = global.passwordResetStats || {
+      date: new Date().toISOString().split('T')[0],
+      attempts: 0,
+      success: 0,
+      failure: 0
+    };
+    
+    if (global.passwordResetStats.date !== new Date().toISOString().split('T')[0]) {
+      global.passwordResetStats = {
+        date: new Date().toISOString().split('T')[0],
+        attempts: 1,
+        success: 1,
+        failure: 0
+      };
+    } else {
+      global.passwordResetStats.attempts++;
+      global.passwordResetStats.success++;
+    }
 
     res.json({ message: 'Password reset email sent' });
   } catch (error) {
     console.error('Password reset request error:', error);
+    
+    // Track error attempt
+    global.passwordResetStats = global.passwordResetStats || {
+      date: new Date().toISOString().split('T')[0],
+      attempts: 0,
+      success: 0,
+      failure: 0
+    };
+    
+    if (global.passwordResetStats.date !== new Date().toISOString().split('T')[0]) {
+      global.passwordResetStats = {
+        date: new Date().toISOString().split('T')[0],
+        attempts: 1,
+        success: 0,
+        failure: 1
+      };
+    } else {
+      global.passwordResetStats.attempts++;
+      global.passwordResetStats.failure++;
+    }
+    
     res.status(500).json({ error: 'Failed to process password reset request' });
   }
 });
