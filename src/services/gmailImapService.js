@@ -736,12 +736,17 @@ function cleanupConnectionPools() {
           // Remove from pool first to prevent reuse
           pool.splice(i, 1);
           
-          // Close connection
-          conn.client.logout().catch(err => {
-            console.warn(`Error closing stale connection for ${accountEmail}:`, err);
-          });
+          // Close connection with better error handling
+          if (conn.client && typeof conn.client.logout === 'function') {
+            conn.client.logout().catch(err => {
+              // Just log the error but don't escalate it
+              if (err.code !== 'NoConnection') {
+                console.warn(`Error closing stale connection for ${accountEmail}:`, err.message);
+              }
+            });
+          }
         } catch (err) {
-          console.warn(`Error during connection cleanup for ${accountEmail}:`, err);
+          console.warn(`Error during connection cleanup for ${accountEmail}:`, err.message);
         }
       }
     }
@@ -1383,7 +1388,7 @@ async function pollForNewEmails(accountEmail) {
       queueDatabaseUpdate(account.id, totalNewEmails);
     }
   } catch (error) {
-    console.error(`Error polling Gmail account ${accountEmail}:`, error);
+    console.error(`Error polling Gmail account ${accountEmail}:`, error.message);
     
     // Update account status in database with more detailed status
     let statusUpdate = 'error';
@@ -1391,7 +1396,6 @@ async function pollForNewEmails(accountEmail) {
         error.message?.includes('authentication failed') ||
         error.message?.includes('[AUTH]')) {
       statusUpdate = 'auth-error';
-      console.log(`Account ${accountEmail} has invalid credentials - marked as auth-error`);
       
       try {
         await pool.query(
@@ -1399,7 +1403,7 @@ async function pollForNewEmails(accountEmail) {
           [statusUpdate, accountEmail]
         );
       } catch (dbError) {
-        console.error(`Error updating status for ${accountEmail}:`, dbError);
+        console.error(`Error updating status for ${accountEmail}:`, dbError.message);
       }
       
       // Remove from active polling immediately
@@ -1415,7 +1419,10 @@ async function pollForNewEmails(accountEmail) {
       try {
         connection.release();
       } catch (releaseError) {
-        console.warn(`Error releasing connection for ${accountEmail}:`, releaseError);
+        // Ignore NoConnection errors during release
+        if (releaseError.code !== 'NoConnection') {
+          console.warn(`Error releasing connection for ${accountEmail}:`, releaseError.message);
+        }
       }
     }
   }
@@ -1752,6 +1759,40 @@ async function monitorAccountHealth() {
   try {
     console.log("Monitoring account health...");
     
+    // Get status values from database first to determine the active status name
+    const [statusCheck] = await pool.query(`
+      SELECT DISTINCT status FROM gmail_accounts LIMIT 10
+    `);
+    
+    // Build query based on available status values
+    let activeStatusValue = "active"; // Default
+    if (statusCheck && statusCheck.length > 0) {
+      // Look for something that might represent "active" status
+      const statuses = statusCheck.map(row => row.status);
+      console.log("Available status values:", statuses);
+      
+      // Try to find active status from options
+      if (statuses.includes("active")) {
+        activeStatusValue = "active";
+      } else if (statuses.includes("ACTIVE")) {
+        activeStatusValue = "ACTIVE";
+      } else if (statuses.includes("1")) {
+        activeStatusValue = "1";
+      } else if (statuses.includes("enabled")) {
+        activeStatusValue = "enabled";
+      } else if (statuses.length > 0) {
+        // Use first non-error status if no obvious active status
+        const nonErrorStatus = statuses.find(s => 
+          !s.toLowerCase().includes("error") && 
+          !s.toLowerCase().includes("disabled") &&
+          !s.toLowerCase().includes("inactive")
+        );
+        if (nonErrorStatus) {
+          activeStatusValue = nonErrorStatus;
+        }
+      }
+    }
+    
     // Check active account status
     for (const accountEmail of activeImapAccounts) {
       try {
@@ -1769,7 +1810,8 @@ async function monitorAccountHealth() {
         
         const account = accounts[0];
         
-        if (account.status !== 'active') {
+        // Dynamic status check
+        if (account.status !== activeStatusValue) {
           console.log(`Account ${accountEmail} is no longer active (${account.status}), removing from active accounts`);
           activeImapAccounts.delete(accountEmail);
           cleanupIdleMode(accountEmail);
@@ -1788,13 +1830,14 @@ async function monitorAccountHealth() {
           }
         }
       } catch (error) {
-        console.error(`Error checking health for account ${accountEmail}:`, error);
+        console.error(`Error checking health for account ${accountEmail}:`, error.message);
       }
     }
     
     // Get all active accounts from database to ensure we haven't missed any
     const [allActiveAccounts] = await pool.query(
-      'SELECT * FROM gmail_accounts WHERE status = "active"'
+      `SELECT * FROM gmail_accounts WHERE status = ?`,
+      [activeStatusValue]
     );
     
     for (const account of allActiveAccounts) {
@@ -1808,7 +1851,7 @@ async function monitorAccountHealth() {
     console.log(`IDLE mode status: ${idleAccounts.size} accounts using IDLE`);
     
   } catch (error) {
-    console.error("Error monitoring account health:", error);
+    console.error("Error monitoring account health:", error.message);
   }
 }
 
@@ -1820,10 +1863,43 @@ export async function initializeImapService() {
     // Ensure we start the DB flush interval
     startDbFlushInterval();
     
+    // First check what status values exist in the database
+    const [statusCheck] = await pool.query(`
+      SELECT DISTINCT status FROM gmail_accounts LIMIT 10
+    `);
+    
+    // Determine which status value means "active"
+    let activeStatusValue = "active"; // Default
+    if (statusCheck && statusCheck.length > 0) {
+      // Look for something that might represent "active" status
+      const statuses = statusCheck.map(row => row.status);
+      console.log("Available account status values:", statuses);
+      
+      if (statuses.includes("active")) {
+        activeStatusValue = "active";
+      } else if (statuses.includes("ACTIVE")) {
+        activeStatusValue = "ACTIVE";
+      } else if (statuses.includes("1")) {
+        activeStatusValue = "1";
+      } else if (statuses.includes("enabled")) {
+        activeStatusValue = "enabled";
+      } else if (statuses.length > 0) {
+        // Try to find a non-error status
+        const nonErrorStatus = statuses.find(s => 
+          !s.toLowerCase().includes("error") && 
+          !s.toLowerCase().includes("disabled") &&
+          !s.toLowerCase().includes("inactive")
+        );
+        if (nonErrorStatus) {
+          activeStatusValue = nonErrorStatus;
+        }
+      }
+    }
+    
     // Get all active accounts from the database
     const [accounts] = await pool.query(`
-      SELECT * FROM gmail_accounts WHERE status = 'active'
-    `);
+      SELECT * FROM gmail_accounts WHERE status = ?
+    `, [activeStatusValue]);
     
     console.log(`Found ${accounts.length} active Gmail accounts`);
     
@@ -1842,7 +1918,7 @@ export async function initializeImapService() {
     console.log('IMAP service initialized successfully');
     return true;
   } catch (error) {
-    console.error('Failed to initialize IMAP service:', error);
+    console.error('Failed to initialize IMAP service:', error.message);
     return false;
   }
 }
@@ -2114,17 +2190,47 @@ setInterval(async () => {
 // Load Balancing with improved account selection and rotation
 async function getNextAvailableAccount() {
   try {
+    // First get available status values
+    const [statusCheck] = await pool.query(`
+      SELECT DISTINCT status FROM gmail_accounts LIMIT 10
+    `);
+    
+    // Determine active status value
+    let activeStatusValue = "active"; // Default
+    if (statusCheck && statusCheck.length > 0) {
+      const statuses = statusCheck.map(row => row.status);
+      
+      if (statuses.includes("active")) {
+        activeStatusValue = "active";
+      } else if (statuses.includes("ACTIVE")) {
+        activeStatusValue = "ACTIVE";
+      } else if (statuses.includes("1")) {
+        activeStatusValue = "1";
+      } else if (statuses.includes("enabled")) {
+        activeStatusValue = "enabled";
+      } else if (statuses.length > 0) {
+        const nonErrorStatus = statuses.find(s => 
+          !s.toLowerCase().includes("error") && 
+          !s.toLowerCase().includes("disabled") &&
+          !s.toLowerCase().includes("inactive")
+        );
+        if (nonErrorStatus) {
+          activeStatusValue = nonErrorStatus;
+        }
+      }
+    }
+    
     // Get active accounts with balancing strategy
     const [accounts] = await pool.query(`
       SELECT * 
       FROM gmail_accounts a
-      WHERE a.status = 'active' 
+      WHERE a.status = ? 
       ORDER BY 
         a.alias_count ASC,
         a.quota_used ASC,
         a.last_used ASC
       LIMIT 10  -- Reduced from 15 to focus on most available accounts
-    `);
+    `, [activeStatusValue]);
     
     if (accounts.length === 0) {
       console.error('No available Gmail accounts');
