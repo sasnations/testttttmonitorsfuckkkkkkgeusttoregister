@@ -292,18 +292,28 @@ class ImapConnectionPool {
         try {
           console.log(`Closing IMAP connection for ${email}`);
           
-          // Better connection closing based on state
-          if (connectionData.client.usable) {
-            await connectionData.client.logout();
-          } else if (connectionData.client._socket && connectionData.client._socket.writable) {
-            await connectionData.client.close();
+          // Better connection closing based on state with error handling
+          try {
+            if (connectionData.client.usable) {
+              await connectionData.client.logout();
+            } else if (connectionData.client._socket && connectionData.client._socket.writable) {
+              await connectionData.client.close();
+            }
+          } catch (error) {
+            // Only log meaningful errors, not NoConnection which is expected sometimes
+            if (error.code !== 'NoConnection') {
+              console.error(`Error closing IMAP connection for ${email}:`, error.message);
+            }
           }
-        } catch (error) {
-          console.error(`Error closing IMAP connection for ${email}:`, error);
+        } catch (outerError) {
+          // Catch-all error handler
+          if (outerError.code !== 'NoConnection') {
+            console.error(`Outer error in connection closing for ${email}:`, outerError.message);
+          }
         }
       }
       
-      // Remove from pool
+      // Always remove from pool regardless of errors
       this.connections.delete(email);
     }
   }
