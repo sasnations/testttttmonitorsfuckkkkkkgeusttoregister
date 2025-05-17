@@ -12,19 +12,19 @@ class ImapConnectionPool {
     this.connections = new Map();
     
     // Ultra-fast settings - more connections for speed
-    this.maxConnectionsPerAccount = 10;
-    this.maxHighPriorityConnections = 15;
+    this.maxConnectionsPerAccount = 5;
+    this.maxHighPriorityConnections = 5;
     
     // Account priority cache (email -> priority)
     this.accountPriorities = new Map();
     
     // Shorter connection timeout for faster recovery
-    this.connectionTimeout = 3 * 60 * 1000; // 3 minutes (down from 5)
+    this.connectionTimeout = 2 * 60 * 1000; // 2 minutes (reduced from 3 minutes)
     
     // Fast cleanup interval
-    this.cleanupInterval = setInterval(() => this.cleanupConnections(), 30 * 1000); // every 30 seconds
+    this.cleanupInterval = setInterval(() => this.cleanupConnections(), 20 * 1000); // every 20 seconds (faster cleanup)
     
-    console.log('⚡ IMAP Connection Pool initialized with ultra-fast settings');
+    console.log('⚡ IMAP Connection Pool initialized with connection limits to avoid Gmail errors');
   }
   
   /**
