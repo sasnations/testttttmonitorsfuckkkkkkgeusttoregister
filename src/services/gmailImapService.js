@@ -37,7 +37,7 @@ const SEARCH_WINDOW = 14; // Number of days to search for emails
 const SYNC_POLLING = {
   enabled: true,                    // Master switch for synchronized polling
   pollingInterval: 5000,            // Poll every 5 seconds (super aggressive)
-  maxConcurrentFetches: 20,         // Maximum concurrent fetches (avoid excessive connections)
+  maxConcurrentFetches: 5,          // REDUCED from 20 to 5 to avoid "Too many connections" errors
   fetchTimeout: 10000,              // Timeout each fetch after 10 seconds
   checkAllFolders: true,            // Check both inbox and spam folders
   retryFailedFetches: true,         // Retry failed fetches immediately
@@ -2509,13 +2509,17 @@ async function runSynchronizedPolling() {
       return;
     }
     
-    console.log(`🔄 Running synchronized polling for ${accountAliasMap.size} accounts with aliases`);
+    // Reduced logging to prevent log spam
+    if (accountAliasMap.size > 5) {
+      console.log(`🔄 Running synchronized polling for ${accountAliasMap.size} accounts with aliases`);
+    }
     
     // Create fetch tasks with limit on concurrent execution
     const fetchTasks = [];
     const accounts = Array.from(accountAliasMap.keys());
     
     // Limit concurrent fetches to avoid overwhelming server
+    // CRITICAL: Reduced concurrent fetches to avoid "Too many connections" errors
     const batchSize = Math.min(accounts.length, SYNC_POLLING.maxConcurrentFetches);
     const accountsToProcess = accounts.slice(0, batchSize);
     
@@ -2563,7 +2567,10 @@ async function runSynchronizedPolling() {
       console.log(`⚠️ ${failedCount} account fetches failed - will retry on next poll`);
     }
     
-    console.log(`🔄 Completed synchronized polling cycle: ${successCount}/${fetchTasks.length} successful`);
+    // Reduced logging for normal operation to prevent log spam
+    if (successCount > 5 || failedCount > 0) {
+      console.log(`🔄 Completed synchronized polling cycle: ${successCount}/${fetchTasks.length} successful`);
+    }
     
   } catch (error) {
     console.error('Error in synchronized polling:', error.message);
@@ -2616,36 +2623,43 @@ async function fetchAllAliasesForAccount(accountEmail, aliases) {
             const uids = searchResults.slice().sort((a, b) => b - a);
             const messagesToFetch = uids.slice(0, 30); // Fetch 30 most recent (increased from 10)
             
-            // Fetch messages
-            for await (const message of client.fetch(messagesToFetch, { 
-              envelope: true, source: true, uid: true 
-            })) {
-              try {
-                // Skip if the alias has been removed during processing
-                if (!isAliasActive(alias)) continue;
-                
-                // Parse message
-                const email = await parseImapMessage(message.source.toString(), alias);
-                
-                // Add to cache if not already there
-                const cacheKey = `${alias}:${message.uid}`;
-                
-                if (!emailCache.has(cacheKey)) {
-                  addToEmailCache(cacheKey, email);
-                  totalEmails++;
+            // FIXED: Don't use stream events - use simple for-await loop
+            try {
+              // Fetch messages using simple for-await loop (this is safer)
+              for await (const message of client.fetch(messagesToFetch, { 
+                envelope: true, source: true, uid: true 
+              })) {
+                try {
+                  // Skip if the alias has been removed during processing
+                  if (!isAliasActive(alias)) continue;
                   
-                  // Notify connected clients
-                  notifyClients(alias, email);
+                  // Parse message
+                  const email = await parseImapMessage(message.source.toString(), alias);
                   
-                  fetchResults.push({
-                    alias,
-                    messageId: message.uid,
-                    folder
-                  });
+                  // Add to cache if not already there
+                  const cacheKey = `${alias}:${message.uid}`;
+                  
+                  if (!emailCache.has(cacheKey)) {
+                    addToEmailCache(cacheKey, email);
+                    totalEmails++;
+                    
+                    // Notify connected clients
+                    notifyClients(alias, email);
+                    
+                    fetchResults.push({
+                      alias,
+                      messageId: message.uid,
+                      folder
+                    });
+                  }
+                } catch (err) {
+                  console.error(`Error processing message: ${err.message}`);
                 }
-              } catch (err) {
-                console.error(`Error processing message: ${err.message}`);
               }
+            } catch (fetchError) {
+              // Handle fetch errors more gracefully
+              console.error(`Error fetching messages for ${alias} in ${folder}: ${fetchError.message}`);
+              // Continue with next alias
             }
           } catch (aliasError) {
             console.error(`Error processing alias ${alias}:`, aliasError.message);
