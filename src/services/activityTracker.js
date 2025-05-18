@@ -28,6 +28,9 @@ const TIME_BUCKETS = {
 // Data retention period - delete data older than this
 const DATA_RETENTION_PERIOD = 2 * 60 * 60 * 1000; // 2 hours
 
+// Track which URLs we've processed for WebSocket upgrades to avoid double processing
+const processedSocketUrls = new Set();
+
 // Create WebSocket server without attaching to HTTP server (noServer mode)
 let wss;
 
@@ -79,14 +82,49 @@ export function setupActivityTracker(server) {
     });
   });
 
-  // Manual handling of upgrade requests to avoid conflicts with other WebSocket servers
-  server.on('upgrade', (request, socket, head) => {
-    // Only handle WebSocket upgrade for our specific path
-    if (request.url === '/activity-ws') {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-      });
+  // Manage WebSocket upgrade - use a unique handler identifier
+  const activityTrackerHandler = (request, socket, head) => {
+    // Create a unique ID for this socket to prevent double processing
+    const socketId = `${request.url}:${socket.remoteAddress}:${socket.remotePort}`;
+    
+    // Only handle WebSocket upgrade for our specific path and only if we haven't processed this socket
+    if (request.url === '/activity-ws' && !processedSocketUrls.has(socketId)) {
+      // Mark as processed to prevent double handling
+      processedSocketUrls.add(socketId);
+      
+      // Clean up the set periodically to prevent memory leaks
+      setTimeout(() => {
+        processedSocketUrls.delete(socketId);
+      }, 10000); // Remove after 10 seconds
+      
+      try {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          wss.emit('connection', ws, request);
+        });
+      } catch (error) {
+        console.error('Error handling WebSocket upgrade for activity tracker:', error);
+        
+        // If we can't handle the upgrade, make sure we don't leave the socket hanging
+        if (socket.readyState === socket.OPEN) {
+          socket.destroy();
+        }
+      }
+      
+      // Return true to indicate we handled this upgrade
+      return true;
     }
+    
+    // Return false to indicate we didn't handle this upgrade
+    return false;
+  };
+
+  // Register our handler on the server
+  server.on('upgrade', (request, socket, head) => {
+    // Try to handle with activity tracker
+    const handled = activityTrackerHandler(request, socket, head);
+    
+    // If our handler didn't process this, it will fall through to other handlers
+    // No need to do anything here, as other handlers will check their own paths
   });
 
   // Start periodic broadcasting of updates to all clients
@@ -96,8 +134,11 @@ export function setupActivityTracker(server) {
       broadcastUpdate();
     }
     
-    // Cleanup old data
-    cleanupOldData();
+    // Cleanup old data but less frequently
+    const now = Date.now();
+    if (now % (60 * 1000) < 5000) { // Run cleanup only once per minute
+      cleanupOldData();
+    }
   }, 5000); // Every 5 seconds
 }
 
@@ -226,7 +267,7 @@ function broadcastUpdate() {
 }
 
 // Prepare activity data for transmission, with time-based tracking
-function prepareActivityData() {
+function prepareActivityData(page = 0, limit = 25) {
   const now = Date.now();
   
   // Get active IPs for different time frames
@@ -235,8 +276,8 @@ function prepareActivityData() {
   const activeIps1h = getActiveIpsByTimeframe(TIME_BUCKETS.ONE_HOUR);
   const activeIps2h = getActiveIpsByTimeframe(TIME_BUCKETS.TWO_HOURS);
   
-  // Map active IPs to a more detailed format for display
-  const activeIpsDetailed = Array.from(activeUsers.byIp.values())
+  // Get all IPs active in the last 15 minutes
+  const allActiveIps = Array.from(activeUsers.byIp.values())
     .filter(user => (now - user.lastSeen) < TIME_BUCKETS.FIFTEEN_MIN)
     .map(user => ({
       ip: user.ip,
@@ -246,6 +287,10 @@ function prepareActivityData() {
       userIds: Array.from(user.userIds)
     }))
     .sort((a, b) => b.lastSeen - a.lastSeen);
+  
+  // Apply pagination to limit the number of IPs sent to the frontend
+  const startIndex = page * limit;
+  const activeIpsDetailed = allActiveIps.slice(startIndex, startIndex + limit);
   
   // Get top endpoints
   const topEndpoints = Array.from(activeUsers.endpointStats.entries())
@@ -276,8 +321,10 @@ function prepareActivityData() {
     activeUsers30m: activeIps30m.length,
     activeUsers1h: activeIps1h.length,
     activeUsers2h: activeIps2h.length,
-    uniqueIps: activeIpsDetailed.length,
+    uniqueIps: allActiveIps.length,
     activeIps: activeIpsDetailed,
+    totalPages: Math.ceil(allActiveIps.length / limit),
+    currentPage: page,
     topEndpoints,
     recentRequests,
     lastUpdate: activeUsers.lastUpdate
@@ -328,6 +375,90 @@ function clearActivityStats() {
 }
 
 // Get a summary of current activity (for API endpoint)
-export function getActivitySummary() {
-  return prepareActivityData();
+export function getActivitySummary(page = 0, limit = 25, filters = {}) {
+  // Extract filter parameters
+  const { ipFilter = '', minRequests = 0, userType = 'all' } = filters;
+  
+  // Get the current timestamp
+  const now = Date.now();
+  
+  // Get all IPs active in the last 15 minutes
+  let allActiveIps = Array.from(activeUsers.byIp.values())
+    .filter(user => (now - user.lastSeen) < TIME_BUCKETS.FIFTEEN_MIN);
+
+  // Apply filters
+  if (ipFilter) {
+    allActiveIps = allActiveIps.filter(user => user.ip.includes(ipFilter));
+  }
+  
+  if (minRequests && !isNaN(minRequests)) {
+    allActiveIps = allActiveIps.filter(user => user.requestCount >= Number(minRequests));
+  }
+  
+  if (userType === 'guest') {
+    allActiveIps = allActiveIps.filter(user => 
+      user.userIds.size === 1 && user.userIds.has('guest'));
+  } else if (userType === 'registered') {
+    allActiveIps = allActiveIps.filter(user => 
+      !user.userIds.has('guest') || user.userIds.size > 1);
+  }
+  
+  // Process filtered IPs to create the summary data
+  const processedActiveIps = allActiveIps.map(user => ({
+    ip: user.ip,
+    requestCount: user.requestCount,
+    lastSeen: user.lastSeen,
+    uniquePathCount: user.paths.size,
+    userIds: Array.from(user.userIds)
+  }))
+  .sort((a, b) => b.lastSeen - a.lastSeen);
+  
+  // Apply pagination to limit the number of IPs sent to the frontend
+  const startIndex = page * limit;
+  const totalPages = Math.ceil(processedActiveIps.length / limit);
+  const activeIpsDetailed = processedActiveIps.slice(startIndex, startIndex + limit);
+  
+  // Get active IPs for different time frames - these don't use the filters
+  const activeIps15m = getActiveIpsByTimeframe(TIME_BUCKETS.FIFTEEN_MIN);
+  const activeIps30m = getActiveIpsByTimeframe(TIME_BUCKETS.THIRTY_MIN);
+  const activeIps1h = getActiveIpsByTimeframe(TIME_BUCKETS.ONE_HOUR);
+  const activeIps2h = getActiveIpsByTimeframe(TIME_BUCKETS.TWO_HOURS);
+  
+  // Get top endpoints
+  const topEndpoints = Array.from(activeUsers.endpointStats.entries())
+    .map(([path, stats]) => ({
+      path,
+      count: stats.count,
+      methods: Object.fromEntries(stats.methods)
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+  
+  // Get recent requests with formatted data
+  const recentRequests = activeUsers.recentRequests
+    .slice(0, 20)
+    .map(req => ({
+      id: req.id,
+      ip: req.ip,
+      path: req.path,
+      method: req.method,
+      timestamp: req.timestamp,
+      statusCode: req.statusCode,
+      isError: req.isError
+    }));
+  
+  return {
+    // Active users = unique IPs, per user request
+    activeUsers15m: activeIps15m.length,
+    activeUsers30m: activeIps30m.length,
+    activeUsers1h: activeIps1h.length,
+    activeUsers2h: activeIps2h.length,
+    uniqueIps: processedActiveIps.length,
+    activeIps: activeIpsDetailed,
+    totalPages,
+    currentPage: page,
+    topEndpoints,
+    recentRequests,
+    lastUpdate: activeUsers.lastUpdate
+  };
 } 
