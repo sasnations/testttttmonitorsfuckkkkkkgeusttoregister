@@ -7,6 +7,7 @@ import {
   getRecentIps
 } from '../middleware/requestTracker.js';
 import { manualCleanup } from '../utils/cleanup.js';
+import { getActivitySummary } from '../services/activityTracker.js';
 
 const router = express.Router();
 
@@ -14,6 +15,22 @@ const router = express.Router();
 const checkAdminPassphrase = (req) => {
   return req.headers['admin-access'] === process.env.ADMIN_PASSPHRASE;
 };
+
+// New endpoint for real-time activity monitoring
+router.get('/real-time-activity', async (req, res) => {
+  if (!checkAdminPassphrase(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    // Get activity data from in-memory cache
+    const activityData = getActivitySummary();
+    res.json(activityData);
+  } catch (error) {
+    console.error('Failed to fetch real-time activity:', error);
+    res.status(500).json({ error: 'Failed to fetch real-time activity' });
+  }
+});
 
 // Get overall statistics
 router.get('/stats', async (req, res) => {
