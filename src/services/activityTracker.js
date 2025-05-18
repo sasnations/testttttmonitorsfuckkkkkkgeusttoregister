@@ -7,29 +7,38 @@ const activeUsers = {
   clients: new Map(),
   // Store active users by IP address
   byIp: new Map(),
-  // Track total active users count
-  totalCount: 0,
   // Store request counts by endpoint
   endpointStats: new Map(),
   // Store recent requests for display
   recentRequests: [],
   // Maximum number of recent requests to keep
   maxRecentRequests: 100,
-  // Track session info
-  sessions: new Map(),
   // Last update timestamp
   lastUpdate: Date.now()
 };
 
+// Time buckets for tracking activity (in milliseconds)
+const TIME_BUCKETS = {
+  FIFTEEN_MIN: 15 * 60 * 1000,
+  THIRTY_MIN: 30 * 60 * 1000,
+  ONE_HOUR: 60 * 60 * 1000,
+  TWO_HOURS: 2 * 60 * 60 * 1000
+};
+
+// Data retention period - delete data older than this
+const DATA_RETENTION_PERIOD = 2 * 60 * 60 * 1000; // 2 hours
+
+// Create WebSocket server without attaching to HTTP server (noServer mode)
+let wss;
+
 // Initialize WebSocket Server
 export function setupActivityTracker(server) {
-  const wss = new WebSocket.Server({ 
-    server,
-    path: '/activity-ws'
-  });
+  // Create WebSocket server without attaching to server
+  wss = new WebSocket.Server({ noServer: true });
 
-  console.log('Activity tracking WebSocket server initialized');
+  console.log('Activity tracking WebSocket server initialized in noServer mode');
 
+  // Handle WebSocket connection
   wss.on('connection', (ws, req) => {
     const clientId = uuidv4();
     const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || 
@@ -70,6 +79,16 @@ export function setupActivityTracker(server) {
     });
   });
 
+  // Manual handling of upgrade requests to avoid conflicts with other WebSocket servers
+  server.on('upgrade', (request, socket, head) => {
+    // Only handle WebSocket upgrade for our specific path
+    if (request.url === '/activity-ws') {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    }
+  });
+
   // Start periodic broadcasting of updates to all clients
   setInterval(() => {
     // Only broadcast if there are connected clients
@@ -77,8 +96,8 @@ export function setupActivityTracker(server) {
       broadcastUpdate();
     }
     
-    // Cleanup old sessions (inactive for more than 15 minutes)
-    cleanupInactiveSessions();
+    // Cleanup old data
+    cleanupOldData();
   }, 5000); // Every 5 seconds
 }
 
@@ -91,7 +110,6 @@ export function trackActivity(req, res) {
   const path = req.originalUrl || req.url;
   const method = req.method;
   const timestamp = Date.now();
-  const sessionId = req.sessionID || req.cookies?.sessionID || uuidv4();
   
   // Get or create user entry
   if (!activeUsers.byIp.has(ip)) {
@@ -105,8 +123,6 @@ export function trackActivity(req, res) {
       userAgents: new Set(),
       recentRequests: []
     });
-    // Increment total when new IP is seen
-    activeUsers.totalCount++;
   }
   
   const userInfo = activeUsers.byIp.get(ip);
@@ -124,22 +140,6 @@ export function trackActivity(req, res) {
     userInfo.paths.set(path, { count: 0 });
   }
   userInfo.paths.get(path).count++;
-  
-  // Track session information
-  if (!activeUsers.sessions.has(sessionId)) {
-    activeUsers.sessions.set(sessionId, {
-      sessionId,
-      ip,
-      userId,
-      startTime: timestamp,
-      lastActivity: timestamp,
-      requestCount: 0
-    });
-  }
-  
-  const sessionInfo = activeUsers.sessions.get(sessionId);
-  sessionInfo.lastActivity = timestamp;
-  sessionInfo.requestCount++;
   
   // Add to global recent requests (limited to maxRecentRequests)
   const request = {
@@ -225,15 +225,19 @@ function broadcastUpdate() {
   }
 }
 
-// Prepare activity data for transmission
+// Prepare activity data for transmission, with time-based tracking
 function prepareActivityData() {
-  // Get active sessions (active in last 15 minutes)
-  const activeSessions = Array.from(activeUsers.sessions.values())
-    .filter(session => (Date.now() - session.lastActivity) < 15 * 60 * 1000);
+  const now = Date.now();
   
-  // Get active IPs (active in last 15 minutes)
-  const activeIps = Array.from(activeUsers.byIp.values())
-    .filter(user => (Date.now() - user.lastSeen) < 15 * 60 * 1000)
+  // Get active IPs for different time frames
+  const activeIps15m = getActiveIpsByTimeframe(TIME_BUCKETS.FIFTEEN_MIN);
+  const activeIps30m = getActiveIpsByTimeframe(TIME_BUCKETS.THIRTY_MIN);
+  const activeIps1h = getActiveIpsByTimeframe(TIME_BUCKETS.ONE_HOUR);
+  const activeIps2h = getActiveIpsByTimeframe(TIME_BUCKETS.TWO_HOURS);
+  
+  // Map active IPs to a more detailed format for display
+  const activeIpsDetailed = Array.from(activeUsers.byIp.values())
+    .filter(user => (now - user.lastSeen) < TIME_BUCKETS.FIFTEEN_MIN)
     .map(user => ({
       ip: user.ip,
       requestCount: user.requestCount,
@@ -267,35 +271,59 @@ function prepareActivityData() {
     }));
   
   return {
-    totalActiveUsers: activeSessions.length,
-    uniqueIps: activeIps.length,
-    activeIps,
+    // Active users = unique IPs, per user request
+    activeUsers15m: activeIps15m.length,
+    activeUsers30m: activeIps30m.length,
+    activeUsers1h: activeIps1h.length,
+    activeUsers2h: activeIps2h.length,
+    uniqueIps: activeIpsDetailed.length,
+    activeIps: activeIpsDetailed,
     topEndpoints,
     recentRequests,
     lastUpdate: activeUsers.lastUpdate
   };
 }
 
-// Cleanup inactive sessions
-function cleanupInactiveSessions() {
+// Helper function to get active IPs by timeframe
+function getActiveIpsByTimeframe(timeframe) {
   const now = Date.now();
-  const inactivityThreshold = 15 * 60 * 1000; // 15 minutes
+  return Array.from(activeUsers.byIp.values())
+    .filter(user => (now - user.lastSeen) < timeframe);
+}
+
+// Cleanup old data that exceeds the retention period
+function cleanupOldData() {
+  const now = Date.now();
   
-  for (const [sessionId, session] of activeUsers.sessions.entries()) {
-    if (now - session.lastActivity > inactivityThreshold) {
-      activeUsers.sessions.delete(sessionId);
+  // 1. Clean up old IP entries
+  for (const [ip, data] of activeUsers.byIp.entries()) {
+    if (now - data.lastSeen > DATA_RETENTION_PERIOD) {
+      activeUsers.byIp.delete(ip);
     }
   }
+  
+  // 2. Clean up old recent requests
+  activeUsers.recentRequests = activeUsers.recentRequests.filter(
+    req => (now - req.timestamp) < DATA_RETENTION_PERIOD
+  );
+  
+  // 3. Check for unused endpoint stats and clean them up too
+  for (const [path, stats] of activeUsers.endpointStats.entries()) {
+    // Endpoint is considered unused if none of the recent requests used it
+    if (!activeUsers.recentRequests.some(req => req.path === path)) {
+      activeUsers.endpointStats.delete(path);
+    }
+  }
+  
+  console.log(`Cleaned up old data. Active IPs: ${activeUsers.byIp.size}, Recent requests: ${activeUsers.recentRequests.length}, Endpoint stats: ${activeUsers.endpointStats.size}`);
 }
 
 // Clear all activity statistics (keep active connections)
 function clearActivityStats() {
   // Keep the clients connected but reset all stats
   activeUsers.byIp.clear();
-  activeUsers.totalCount = 0;
   activeUsers.endpointStats.clear();
   activeUsers.recentRequests = [];
-  activeUsers.sessions.clear();
   activeUsers.lastUpdate = Date.now();
 }
 
